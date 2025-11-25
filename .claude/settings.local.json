@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(del test_token_request.py test_final_solution.py test_capss_upload.py)",
+      "Bash(pyinstaller:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

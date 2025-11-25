@@ -751,7 +751,7 @@ class CAPPSConverter:
             print(f"Token obtained successfully: {token[:20]}...")
             
             # Upload file
-            upload_url = "https://capss.doj.ca.gov/api/bulkupload/save"
+            upload_url = "https://capss.doj.ca.gov/api/bulkupload/save?onError=submit"
             headers = {"Authorization": f"Bearer {token}"}
 
             with open(xml_file_path, 'rb') as f:
