@@ -9,7 +9,7 @@ Handles two-file processing: purchases.csv and serials.csv
 import csv
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
-from datetime import datetime
+from datetime import datetime, timedelta
 import argparse
 import os
 from pathlib import Path
@@ -459,7 +459,59 @@ class CAPPSConverter:
             'CHARCOAL': 'GRAY', 'SLATE': 'GRAY',
             'AMBER': 'ORANGE', 'COPPER': 'ORANGE'
         }
-    
+
+        # Submitted transactions cache - tracks IDs uploaded to CAPSS
+        self.submitted_cache_file = Path.home() / '.capps_submitted_transactions.json'
+        self.submitted_cache = {}
+        self.load_submitted_cache()
+
+    def load_submitted_cache(self):
+        """Load the cache of successfully submitted transaction IDs, pruning entries older than 30 days"""
+        try:
+            if self.submitted_cache_file.exists():
+                with open(self.submitted_cache_file, 'r') as f:
+                    raw = json.load(f)
+                cutoff = datetime.now() - timedelta(days=30)
+                self.submitted_cache = {
+                    tn: entry for tn, entry in raw.items()
+                    if datetime.fromisoformat(entry.get("submitted_at", "")) > cutoff
+                }
+        except:
+            self.submitted_cache = {}
+
+    def save_submitted_cache(self):
+        """Save the submitted transaction cache to disk"""
+        try:
+            with open(self.submitted_cache_file, 'w') as f:
+                json.dump(self.submitted_cache, f, indent=2)
+        except:
+            pass
+
+    def mark_transactions_submitted(self, transaction_numbers):
+        """Add transaction IDs to the submitted cache after a confirmed upload"""
+        submitted_at = datetime.now().isoformat()
+        for tn in transaction_numbers:
+            self.submitted_cache[tn] = {"submitted_at": submitted_at}
+        self.save_submitted_cache()
+
+    def populate_cache_from_xml(self, xml_file_path):
+        """Seed the submitted cache from an existing XML file (one-time import)"""
+        try:
+            tree = ET.parse(xml_file_path)
+            count = 0
+            for elem in tree.getroot().iter('loanBuyNumber'):
+                tn = elem.text.strip() if elem.text else None
+                if tn and tn not in self.submitted_cache:
+                    self.submitted_cache[tn] = {
+                        "submitted_at": datetime.now().isoformat(),
+                        "note": "pre-populated from existing XML"
+                    }
+                    count += 1
+            self.save_submitted_cache()
+            print(f"Pre-populated cache with {count} transactions from {xml_file_path}")
+        except Exception as e:
+            print(f"Warning: Could not pre-populate cache from {xml_file_path}: {e}")
+
     def parse_aimsi_datetime(self, datetime_str):
         """
         Parse AIMsi datetime format: "11/10/2025 11:50:05 AM"
@@ -566,6 +618,7 @@ class CAPPSConverter:
         ET.SubElement(id_elem, 'dateOfIssueText').text = 'on file'
         ET.SubElement(id_elem, 'issueState').text = 'on file'
         ET.SubElement(id_elem, 'issueCountry').text = 'on file'
+        ET.SubElement(id_elem, 'yearOfExpiration').text = ''
         ET.SubElement(id_elem, 'yearOfExpirationText').text = 'on file'
         
         # Signature and fingerprint (base64 encoded placeholders)
@@ -613,7 +666,12 @@ class CAPPSConverter:
         amount = row[2].strip()
         category_id = row[3].strip()
         serial_number = row[4].strip().strip('"')
-        
+
+        # Skip if already successfully submitted to CAPSS
+        if transaction_number in self.submitted_cache:
+            print(f"  Skipping {transaction_number} - already submitted to CAPSS")
+            return False
+
         # Check if transaction is within configured lookback period
         try:
             transaction_dt = datetime.strptime(datetime_str.strip(), "%m/%d/%Y %I:%M:%S %p")
@@ -688,6 +746,7 @@ class CAPPSConverter:
         article = self.category_map.get(category_id, {}).get(subcategory_id, 'INSTRUMENT')
         
         # Required item fields
+        ET.SubElement(item, 'referenceId').text = transaction_number
         ET.SubElement(item, 'type').text = transaction_type
         ET.SubElement(item, 'loanBuyNumber').text = transaction_number
         ET.SubElement(item, 'amount').text = amount
@@ -704,7 +763,7 @@ class CAPPSConverter:
 
         # Other mandatory fields
         ET.SubElement(item, 'inscription').text = "None"
-        ET.SubElement(item, 'ownerAppliedNumber').text = "None"
+        ET.SubElement(item, 'ownerAppliedNumber').text = transaction_number
         ET.SubElement(item, 'pattern').text = "None"
         ET.SubElement(item, 'color').text = self.get_color(description)
         ET.SubElement(item, 'material').text = "Unknown"
@@ -724,7 +783,7 @@ class CAPPSConverter:
 
         try:
             # Get access token
-            token_url = "https://capss.doj.ca.gov/oauth/token"
+            token_url = "https://capss.doj.ca.gov/oauth2/token"
             token_data = {
                 "scope": "api",
                 "grant_type": "client_credentials",
@@ -751,37 +810,48 @@ class CAPPSConverter:
             print(f"Token obtained successfully: {token[:20]}...")
             
             # Upload file
-            upload_url = "https://capss.doj.ca.gov/api/bulkupload/save?onError=submit"
+            upload_url = "https://capss.doj.ca.gov/api/bulkimport/save?onDup=submitWithoutDups&onError=submit"
             headers = {"Authorization": f"Bearer {token}"}
 
-            with open(xml_file_path, 'rb') as f:
-                files = {"bulkUploadFile": f}
-                upload_response = session.post(upload_url, headers=headers, files=files, verify=False)
-            
-            if upload_response.status_code == 202:
-                result = upload_response.json()
-                status_url = result.get("links", {}).get("href", "")
-                print(f"✓ Upload accepted. Submission ID: {result['submission']['submissionId']}")
-                
-                # Check status
-                if status_url:
-                    import time
-                    for i in range(10):  # Poll up to 10 times
-                        time.sleep(2)
-                        status_response = session.get(status_url, headers=headers, verify=False)
-                        if status_response.status_code == 200:
-                            status_data = status_response.json()
-                            if status_data["status"] == "complete":
-                                print("Processing complete!")
-                                return True
-                        elif status_response.status_code != 202:
-                            print(f"Status check failed: {status_response.status_code}")
-                            return False
-                return True
-            else:
-                print(f"Upload failed: {upload_response.status_code}")
-                print(upload_response.text)
-                return False
+            attempts = 0
+            while (attempts < 10):
+                with open(xml_file_path, 'rb') as f:
+                    files = {"bulkUploadFile": f}
+                    upload_response = session.post(upload_url, headers=headers, files=files, verify=False)
+
+                if upload_response.status_code == 202:
+                    result = upload_response.json()
+                    status_url = result.get("links", {}).get("href", "")
+                    print(f"✓ Upload accepted. Submission ID: {result['submission']['submissionId']}")
+                    
+                    # Check status
+                    if status_url:
+                        import time
+                        for i in range(10):  # Poll up to 10 times
+                            time.sleep(2)
+                            status_response = session.get(status_url, headers=headers, verify=False)
+                            if status_response.status_code == 200:
+                                status_data = status_response.json()
+                                if status_data["status"] == "complete":
+                                    print("Processing complete!")
+                                    submitted_ids = [
+                                        elem.text.strip()
+                                        for elem in ET.parse(xml_file_path).getroot().iter('loanBuyNumber')
+                                        if elem.text
+                                    ]
+                                    self.mark_transactions_submitted(submitted_ids)
+                                    print(f"✓ Marked {len(submitted_ids)} transactions as submitted in cache")
+                                    return True
+                            elif status_response.status_code != 202:
+                                print(f"Status check failed: {status_response}")
+                                return False
+                    return True
+                else:
+                    print(f"Upload Attempt {attempts} failed: {upload_response.status_code}")
+                    print(upload_response.text)
+                    attempts += 1
+            print("Attempt 10 failed. Exiting.")
+            return False
                 
         except Exception as e:
             print(f"CAPSS upload error: {e}")
